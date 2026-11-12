@@ -260,6 +260,10 @@ bool animator_cancel(struct animator* animator, void* target, animator_function*
 }
 
 bool animator_update(struct animator* animator, uint64_t time) {
+  if (animator->animation_count == 0) {  // a zero-length VLA below is UB
+    animator_destroy_display_link(animator);
+    return false;
+  }
   bool needs_refresh = false;
   struct animation* remove[animator->animation_count];
   memset(remove, 0, animator->animation_count);

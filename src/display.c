@@ -1,12 +1,23 @@
 #include "display.h"
 #include "display_nsscreen.h"
 #include "misc/helpers.h"
+#include <stdatomic.h>
+#ifdef ITEM_WINDOW_REUSE_TEST
+#include <string.h>
+#endif
 
 extern int workspace_display_notch_height(uint32_t did);
 extern int g_connection;
 extern int g_space_management_mode;
 extern bool g_brightness_events;
 
+
+#ifdef ITEM_WINDOW_REUSE_TEST
+uint32_t g_test_display_count = 0;
+uint32_t g_test_display_dids[8];
+int g_test_display_adids[8];
+uint32_t g_test_display_active_adid = 0;
+#endif
 
 float g_last_brightness = -1.f;
 static void brightness_handler(void* notification_center, uint32_t did, void* name, const void* sender, CFDictionaryRef info) {
@@ -21,27 +32,48 @@ static void brightness_handler(void* notification_center, uint32_t did, void* na
   }
 }
 
+static atomic_bool g_display_reconcile_pending;
+
+// Every physical event runs the same full reconcile (did is unused), so on 26+
+// one pass per main-queue burst replaces one pass per display per flag.
+static void display_post_physical(uint32_t did, enum event_type type) {
+  if (__builtin_available(macOS 26.0, *)) {
+    if (atomic_exchange(&g_display_reconcile_pending, true)) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      // Clear before the pass: a callback during it queues exactly one more.
+      atomic_store(&g_display_reconcile_pending, false);
+      struct event event = { (void *)(intptr_t) did, type };
+      event_post(&event);
+    });
+  } else {
+    struct event event = { (void *)(intptr_t) did, type };
+    event_post(&event);
+  }
+}
+
 static DISPLAY_EVENT_HANDLER(display_handler) {
   if (flags & kCGDisplayAddFlag) {
-    struct event event = { (void *)(intptr_t) did, DISPLAY_ADDED };
-    event_post(&event);
+    display_post_physical(did, DISPLAY_ADDED);
 
     if (g_brightness_events && DisplayServicesCanChangeBrightness(did))
       DisplayServicesRegisterForBrightnessChangeNotifications(did, did, (void*)brightness_handler);
   } else if (flags & kCGDisplayRemoveFlag) {
-    struct event event = { (void *)(intptr_t) did, DISPLAY_REMOVED };
-    event_post(&event);
+    display_post_physical(did, DISPLAY_REMOVED);
 
     if (g_brightness_events && DisplayServicesCanChangeBrightness(did))
       DisplayServicesUnregisterForBrightnessChangeNotifications(did, did);
   } else if (flags & kCGDisplayMovedFlag) {
-    struct event event = { (void *)(intptr_t) did, DISPLAY_MOVED };
-    event_post(&event);
+    display_post_physical(did, DISPLAY_MOVED);
   } else if (flags & kCGDisplayDesktopShapeChangedFlag) {
-    struct event event = { (void *)(intptr_t) did, DISPLAY_RESIZED };
-    event_post(&event);
+    display_post_physical(did, DISPLAY_RESIZED);
   }
 }
+
+#ifdef ITEM_WINDOW_REUSE_TEST
+void display_test_callback(uint32_t did, CGDisplayChangeSummaryFlags flags) {
+  display_handler(did, flags, NULL);
+}
+#endif
 
 CFStringRef display_uuid(uint32_t did) {
   CFUUIDRef uuid_ref = CGDisplayCreateUUIDFromDisplayID(did);
@@ -102,6 +134,15 @@ uint64_t *display_space_list(uint32_t did, int *count) {
 }
 
 int display_arrangement(uint32_t did) {
+#ifdef ITEM_WINDOW_REUSE_TEST
+  if (g_test_display_count) {
+    for (uint32_t i = 0; i < g_test_display_count && i < 8; i++) {
+      if (g_test_display_dids[i] == did)
+        return g_test_display_adids[i] ? g_test_display_adids[i] : (int)(i + 1);
+    }
+    return 0;
+  }
+#endif
   if (display_active_display_count() == 1) {
     uint32_t result = 0;
     uint32_t count = 0;
@@ -134,6 +175,9 @@ int display_arrangement(uint32_t did) {
 }
 
 uint32_t display_main_display_id(void) {
+#ifdef ITEM_WINDOW_REUSE_TEST
+  if (g_test_display_count) return g_test_display_dids[0];
+#endif
   return CGMainDisplayID();
 }
 
@@ -195,6 +239,12 @@ CFStringRef display_arrangement_display_uuid(int arrangement) {
 }
 
 uint32_t display_arrangement_display_id(int arrangement) {
+#ifdef ITEM_WINDOW_REUSE_TEST
+  if (g_test_display_count) {
+    if (arrangement < 1 || (uint32_t)arrangement > g_test_display_count) return 0;
+    return g_test_display_dids[arrangement - 1];
+  }
+#endif
   uint32_t result = 0;
   CFArrayRef displays = SLSCopyManagedDisplays(g_connection);
 
@@ -213,6 +263,12 @@ uint32_t display_arrangement_display_id(int arrangement) {
 }
 
 uint32_t display_active_display_adid(void) {
+#ifdef ITEM_WINDOW_REUSE_TEST
+  if (g_test_display_count) {
+    if (g_test_display_active_adid) return g_test_display_active_adid;
+    return g_test_display_adids[0] ? (uint32_t)g_test_display_adids[0] : 1;
+  }
+#endif
   if (display_active_display_count() == 1) return 1;
 
   CFStringRef uuid = display_active_display_uuid();
@@ -274,6 +330,9 @@ CGRect display_menu_bar_rect(uint32_t did) {
 }
 
 uint32_t display_active_display_count(void) {
+#ifdef ITEM_WINDOW_REUSE_TEST
+  if (g_test_display_count) return g_test_display_count;
+#endif
   uint32_t count;
   CGGetActiveDisplayList(0, NULL, &count);
   return count;
@@ -282,6 +341,13 @@ uint32_t display_active_display_count(void) {
 uint32_t *display_active_display_list(uint32_t *count) {
   int display_count = display_active_display_count();
   uint32_t *result = malloc(sizeof(uint32_t) * display_count);
+#ifdef ITEM_WINDOW_REUSE_TEST
+  if (g_test_display_count) {
+    memcpy(result, g_test_display_dids, sizeof(uint32_t) * display_count);
+    if (count) *count = (uint32_t)display_count;
+    return result;
+  }
+#endif
   CGGetActiveDisplayList(display_count, result, count);
   return result;
 }

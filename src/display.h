@@ -9,6 +9,12 @@ uint32_t display_main_display_id(void);
 uint32_t display_active_display_id(void);
 uint32_t display_active_display_adid(void);
 uint32_t display_arrangement_display_id(int arrangement);
+#ifdef ITEM_WINDOW_REUSE_TEST
+extern uint32_t g_test_display_count;
+extern uint32_t g_test_display_dids[8];
+extern int g_test_display_adids[8];
+extern uint32_t g_test_display_active_adid;
+#endif
 bool display_menu_bar_visible(void);
 CGRect display_menu_bar_rect(uint32_t did);
 uint32_t display_active_display_count(void);

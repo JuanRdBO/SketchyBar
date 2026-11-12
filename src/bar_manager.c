@@ -582,51 +582,92 @@ void bar_manager_reset(struct bar_manager* bar_manager) {
   bar_manager_begin(bar_manager);
 }
 
+static void bar_manager_refresh_kept_bar(struct bar* bar, uint32_t adid) {
+  bar->adid = adid;
+  bar->dsid = display_space_id(bar->did);
+  bar->sid = mission_control_index(bar->dsid);
+  bar->shown = SLSSpaceGetType(g_connection, bar->dsid) != 4;
+  bar->mouse_over = false;
+  g_bar_manager.bar_needs_update = true;
+}
+
 void bar_manager_begin(struct bar_manager* bar_manager) {
+  // ponytail: ADIDs 1..31 only; per-ADID masks use 1 << adid with bit 0 unused
+  uint32_t want_did[32];
+  uint32_t want_adid[32];
+  uint32_t want = 0;
   if (bar_manager->displays == DISPLAY_MAIN_PATTERN) {
-    uint32_t did = display_main_display_id();
-    bar_manager->bar_count = 1;
-    bar_manager->bars = (struct bar **) realloc(
-                                bar_manager->bars,
-                                sizeof(struct bar *) * bar_manager->bar_count);
-
-    memset(bar_manager->bars, 0, sizeof(struct bar*) * bar_manager->bar_count);
-    bar_manager->bars[0] = bar_create(did);
-    bar_manager->bars[0]->adid = display_arrangement(did);
-    if (bar_manager->any_bar_hidden)
-      bar_set_hidden(bar_manager->bars[0], true);
-  }
-  else {
+    want_did[0] = display_main_display_id();
+    want_adid[0] = display_arrangement(want_did[0]);
+    want = 1;
+  } else {
     uint32_t display_count = display_active_display_count();
-    uint32_t bar_count = 0;
-    for (uint32_t index = 1; index <= display_count; index++) {
-      if (!(bar_manager->displays & 1 << (index - 1))) continue;
-      bar_count++;
-    }
-
-    bar_manager->bar_count = bar_count;
-    bar_manager->bars = (struct bar **) realloc(
-                                bar_manager->bars,
-                                sizeof(struct bar *) * bar_manager->bar_count);
-
-    memset(bar_manager->bars, 0, sizeof(struct bar*) * bar_manager->bar_count);
-
-    uint32_t bar_index = 0;
-    for (uint32_t index = 1; index <= display_count; index++) {
-      if (!(bar_manager->displays & 1 << (index - 1))) continue;
-      uint32_t did = display_arrangement_display_id(index);
-      bar_manager->bars[bar_index] = bar_create(did);
-      bar_manager->bars[bar_index]->adid = index;
-      if (bar_manager->any_bar_hidden)
-        bar_set_hidden(bar_manager->bars[bar_index], true);
-
-      bar_index++;
+    for (uint32_t index = 1; index <= display_count && index < 32; index++) {
+      if (!(bar_manager->displays & 1u << (index - 1))) continue;
+      want_did[want] = display_arrangement_display_id(index);
+      want_adid[want] = index;
+      want++;
     }
   }
+
+  uint32_t old_count = bar_manager->bar_count;
+  struct bar* old[32];
+  bool used[32];
+  if (old_count > 32) {
+    for (uint32_t i = 32; i < old_count; i++) {
+      if (bar_manager->bars[i]) bar_destroy(bar_manager->bars[i]);
+    }
+    old_count = 32;
+  }
+  for (uint32_t i = 0; i < old_count; i++) {
+    old[i] = bar_manager->bars[i];
+    used[i] = false;
+  }
+
+  struct bar* next[32];
+  for (uint32_t i = 0; i < want; i++) {
+    struct bar* found = NULL;
+    for (uint32_t j = 0; j < old_count; j++) {
+      if (used[j] || !old[j]) continue;
+      if (old[j]->did == want_did[i] && old[j]->adid == want_adid[i]) {
+        found = old[j];
+        used[j] = true;
+        break;
+      }
+    }
+    if (!found) {
+      for (uint32_t j = 0; j < old_count; j++) {
+        if (used[j] || !old[j]) continue;
+        if (old[j]->did == want_did[i]) {
+          found = old[j];
+          used[j] = true;
+          break;
+        }
+      }
+    }
+    if (found) {
+      bar_manager_refresh_kept_bar(found, want_adid[i]);
+      if (bar_manager->any_bar_hidden) bar_set_hidden(found, true);
+      next[i] = found;
+    } else {
+      next[i] = bar_create(want_did[i]);
+      next[i]->adid = want_adid[i];
+      if (bar_manager->any_bar_hidden) bar_set_hidden(next[i], true);
+    }
+  }
+  for (uint32_t j = 0; j < old_count; j++) {
+    if (!used[j] && old[j]) bar_destroy(old[j]);
+  }
+
+  bar_manager->bar_count = want;
+  bar_manager->bars = (struct bar**) realloc(bar_manager->bars,
+                                             sizeof(struct bar*) * (want ? want : 1));
+  for (uint32_t i = 0; i < want; i++) bar_manager->bars[i] = next[i];
 
   bar_manager->active_displays = 0;
   for (int i = 0; i < bar_manager->bar_count; i++) {
-    bar_manager->active_displays |= 1 << bar_manager->bars[i]->adid;
+    if (bar_manager->bars[i]->adid < 32)
+      bar_manager->active_displays |= 1u << bar_manager->bars[i]->adid;
   }
 
   bar_manager->active_adid = display_active_display_adid();
@@ -639,7 +680,7 @@ struct bar_item* bar_manager_get_item_by_point(struct bar_manager* bar_manager, 
     if (!bar_item->drawing) continue;
 
     for (int adid = 1; adid <= bar_item->num_windows; adid++) {
-      struct window* window = bar_item_get_window(bar_item, adid);
+      struct window* window = bar_item_peek_window(bar_item, adid);
       if (!window) continue;
 
       CGRect frame = window->frame;
@@ -659,7 +700,7 @@ struct bar_item* bar_manager_get_item_by_wid(struct bar_manager* bar_manager, ui
     if (!bar_item->drawing) continue;
 
     for (int adid = 1; adid <= bar_item->num_windows; adid++) {
-      struct window* window = bar_item_get_window(bar_item, adid);
+      struct window* window = bar_item_peek_window(bar_item, adid);
       if (!window) continue;
 
       if (window->id == wid) {
@@ -755,20 +796,111 @@ void bar_manager_custom_events_trigger(struct bar_manager* bar_manager, char* na
   }
 }
 
+static bool bar_manager_physical_item_reuse_available(void) {
+  if (__builtin_available(macOS 26.0, *)) return true;
+  return false;
+}
+
+static void bar_manager_detach_item_windows(struct bar_manager* bar_manager) {
+  for (int j = 0; j < bar_manager->bar_item_count; j++) {
+    struct bar_item* bar_item = bar_manager->bar_items[j];
+    bar_item->popup.needs_ordering = true;
+    for (uint32_t adid = 1; adid <= bar_item->num_windows; adid++) {
+      struct window* window = bar_item_peek_window(bar_item, adid);
+      if (!window || !window->id) continue;
+      SLSRemoveFromOrderingGroup(g_connection, window->id);
+      window->parent = NULL;
+    }
+  }
+}
+
+static void bar_manager_retire_unselected_item_windows(struct bar_manager* bar_manager) {
+  for (int j = 0; j < bar_manager->bar_item_count; j++) {
+    struct bar_item* bar_item = bar_manager->bar_items[j];
+    for (uint32_t adid = 1; adid <= bar_item->num_windows; adid++) {
+      if (bar_manager->active_displays & (1u << adid)) continue;
+      bar_item_remove_window(bar_item, adid);
+    }
+  }
+}
+
+static void bar_manager_send_window_to_space(struct window* window, uint64_t dsid) {
+  if (!window || !window->id) return;
+  window_send_to_space(window, dsid);
+  window_move(window, window->origin);
+}
+
+static void bar_manager_reassign_retained_item_spaces(struct bar_manager* bar_manager) {
+  if (bar_manager->sticky) return;
+  for (int i = 0; i < bar_manager->bar_count; i++) {
+    struct bar* bar = bar_manager->bars[i];
+    if (!bar->shown || bar->adid < 1) continue;
+    uint32_t adid = bar->adid;
+    uint64_t dsid = bar->dsid;
+    for (int j = 0; j < bar_manager->bar_item_count; j++) {
+      struct bar_item* bar_item = bar_manager->bar_items[j];
+      bar_manager_send_window_to_space(bar_item_peek_window(bar_item, adid),
+                                       dsid);
+      if (bar_item->popup.drawing
+          && bar_item->popup.adid == adid
+          && bar_item->popup.window.id) {
+        bar_manager_send_window_to_space(&bar_item->popup.window, dsid);
+      }
+    }
+    bar_manager_send_window_to_space(&bar->window, dsid);
+  }
+}
+
+#ifdef ITEM_WINDOW_REUSE_TEST
+int g_test_physical_passes;
+int g_test_physical_depth;
+int g_test_physical_max_depth;
+void (*g_test_physical_during)(void);
+#endif
+
+static void bar_manager_display_physical(struct bar_manager* bar_manager) {
+  if (!bar_manager_physical_item_reuse_available()) {
+    bar_manager_display_changed(bar_manager);
+    return;
+  }
+#ifdef ITEM_WINDOW_REUSE_TEST
+  g_test_physical_passes++;
+  if (++g_test_physical_depth > g_test_physical_max_depth)
+    g_test_physical_max_depth = g_test_physical_depth;
+  if (g_test_physical_during) g_test_physical_during();
+#endif
+
+  bar_manager->active_adid = display_active_display_adid();
+  bar_manager_freeze(bar_manager);
+  bar_manager_detach_item_windows(bar_manager);
+  bar_manager_reset_bar_association(bar_manager);
+  bar_manager_begin(bar_manager);
+  bar_manager_retire_unselected_item_windows(bar_manager);
+  bar_manager_unfreeze(bar_manager);
+  bar_manager_refresh(bar_manager, true);
+  bar_manager_handle_display_change(bar_manager);
+  bar_manager_handle_space_change(bar_manager, true);
+  bar_manager_reassign_retained_item_spaces(bar_manager);
+  animator_renew_display_link(&bar_manager->animator);
+#ifdef ITEM_WINDOW_REUSE_TEST
+  g_test_physical_depth--;
+#endif
+}
+
 void bar_manager_display_resized(struct bar_manager* bar_manager, uint32_t did) {
-  bar_manager_display_changed(bar_manager);
+  bar_manager_display_physical(bar_manager);
 }
 
 void bar_manager_display_moved(struct bar_manager* bar_manager, uint32_t did) {
-  bar_manager_display_changed(bar_manager);
+  bar_manager_display_physical(bar_manager);
 }
 
 void bar_manager_display_removed(struct bar_manager* bar_manager, uint32_t did) {
-  bar_manager_display_changed(bar_manager);
+  bar_manager_display_physical(bar_manager);
 }
 
 void bar_manager_display_added(struct bar_manager* bar_manager, uint32_t did) {
-  bar_manager_display_changed(bar_manager);
+  bar_manager_display_physical(bar_manager);
 }
 
 void bar_manager_display_changed(struct bar_manager* bar_manager) {
